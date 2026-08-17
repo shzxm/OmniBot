@@ -78,6 +78,7 @@ class HttpControllerResponsesTest {
                     {"role": "user", "content": "Weather in Shanghai?"},
                     {
                       "role": "assistant",
+                      "content": "It is sunny.",
                       "tool_calls": [
                         {
                           "id": "call_1",
@@ -109,14 +110,102 @@ class HttpControllerResponsesTest {
             "Weather in Shanghai?",
             input[0].jsonObject["content"]!!.jsonArray[0].jsonObject["text"]?.jsonPrimitive?.content
         )
-        assertEquals("function_call", input[1].jsonObject["type"]?.jsonPrimitive?.content)
-        assertEquals("call_1", input[1].jsonObject["call_id"]?.jsonPrimitive?.content)
-        assertEquals("function_call_output", input[2].jsonObject["type"]?.jsonPrimitive?.content)
-        assertEquals("{\"temp\":28}", input[2].jsonObject["output"]?.jsonPrimitive?.content)
+        assertEquals(
+            "input_text",
+            input[0].jsonObject["content"]!!.jsonArray[0].jsonObject["type"]?.jsonPrimitive?.content
+        )
+        assertEquals("assistant", input[1].jsonObject["role"]?.jsonPrimitive?.content)
+        assertEquals(
+            "output_text",
+            input[1].jsonObject["content"]!!.jsonArray[0].jsonObject["type"]?.jsonPrimitive?.content
+        )
+        assertEquals(
+            "It is sunny.",
+            input[1].jsonObject["content"]!!.jsonArray[0].jsonObject["text"]?.jsonPrimitive?.content
+        )
+        assertEquals("function_call", input[2].jsonObject["type"]?.jsonPrimitive?.content)
+        assertEquals("call_1", input[2].jsonObject["call_id"]?.jsonPrimitive?.content)
+        assertEquals("function_call_output", input[3].jsonObject["type"]?.jsonPrimitive?.content)
+        assertEquals("{\"temp\":28}", input[3].jsonObject["output"]?.jsonPrimitive?.content)
 
         val tools = root["tools"]!!.jsonArray
         assertEquals("function", tools[0].jsonObject["type"]?.jsonPrimitive?.content)
         assertEquals("get_weather", tools[0].jsonObject["name"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `responses request uses output text for assistant history`() {
+        val method = HttpController::class.java.getDeclaredMethod(
+            "buildOpenAIResponsesRequestBody",
+            String::class.java,
+            String::class.java,
+        )
+        method.isAccessible = true
+        val payload = method.invoke(
+            HttpController,
+            """
+                {
+                  "model": "gpt-5.6-sol",
+                  "messages": [
+                    {"role": "user", "content": "帮我点一杯咖啡"},
+                    {"role": "assistant", "content": "我先搜索外卖应用。"},
+                    {"role": "user", "content": "继续"}
+                  ]
+                }
+            """.trimIndent(),
+            "gpt-5.6-sol",
+        ) as String
+
+        val input = json.parseToJsonElement(payload).jsonObject["input"]!!.jsonArray
+        assertEquals(
+            "input_text",
+            input[0].jsonObject["content"]!!.jsonArray[0]
+                .jsonObject["type"]?.jsonPrimitive?.content,
+        )
+        assertEquals(
+            "output_text",
+            input[1].jsonObject["content"]!!.jsonArray[0]
+                .jsonObject["type"]?.jsonPrimitive?.content,
+        )
+        assertEquals(
+            "input_text",
+            input[2].jsonObject["content"]!!.jsonArray[0]
+                .jsonObject["type"]?.jsonPrimitive?.content,
+        )
+    }
+
+    @Test
+    fun `responses request preserves online VLM latency controls`() {
+        val method = HttpController::class.java.getDeclaredMethod(
+            "buildOpenAIResponsesRequestBody",
+            String::class.java,
+            String::class.java
+        )
+        method.isAccessible = true
+        val payload = method.invoke(
+            HttpController,
+            """
+                {
+                  "model": "scene.vlm.operation.primary",
+                  "stream": true,
+                  "max_completion_tokens": 512,
+                  "reasoning_effort": "none",
+                  "enable_thinking": false,
+                  "parallel_tool_calls": false,
+                  "messages": [{"role": "user", "content": "Open Bluetooth"}]
+                }
+            """.trimIndent(),
+            "gpt-5.6-sol"
+        ) as String
+
+        val root = json.parseToJsonElement(payload).jsonObject
+        assertTrue(root["stream"]?.jsonPrimitive?.content?.toBoolean() == true)
+        assertEquals("512", root["max_output_tokens"]?.jsonPrimitive?.content)
+        assertEquals(
+            "none",
+            root["reasoning"]?.jsonObject?.get("effort")?.jsonPrimitive?.content,
+        )
+        assertEquals(false, root["parallel_tool_calls"]?.jsonPrimitive?.content?.toBoolean())
     }
 
     @Test
@@ -146,7 +235,7 @@ class HttpControllerResponsesTest {
             source,
             null,
             "response.completed",
-            """{"type":"response.completed","response":{"usage":{"input_tokens":2048,"input_tokens_details":{"cached_tokens":1024},"output_tokens":1,"total_tokens":2049}}}"""
+            """{"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":3,"total_tokens":7,"input_tokens_details":{"cached_tokens":2},"output_tokens_details":{"reasoning_tokens":2,"text_tokens":1}}}}"""
         )
 
         val accumulator = AgentLlmStreamAccumulator(json)
@@ -154,12 +243,17 @@ class HttpControllerResponsesTest {
         val turn = accumulator.buildTurn()
 
         assertEquals("Hello", turn.message.contentText())
-        assertEquals(2048, turn.usage?.promptTokens)
-        assertEquals(1, turn.usage?.completionTokens)
+        assertEquals(4, turn.usage?.promptTokens)
+        assertEquals(3, turn.usage?.completionTokens)
         assertEquals(
-            "1024",
+            "2",
             turn.usage?.promptTokensDetails?.jsonObject
-                ?.get("cached_tokens")?.jsonPrimitive?.content
+                ?.get("cached_tokens")?.jsonPrimitive?.content,
+        )
+        assertEquals(
+            "2",
+            turn.usage?.completionTokensDetails?.jsonObject
+                ?.get("reasoning_tokens")?.jsonPrimitive?.content,
         )
     }
 
@@ -254,6 +348,119 @@ class HttpControllerResponsesTest {
         assertEquals("get_weather", turn.message.toolCalls?.first()?.function?.name)
         assertEquals("""{"city":"Shanghai"}""", turn.message.toolCalls?.first()?.function?.arguments)
         assertEquals("tool_calls", turn.finishReason)
+    }
+
+    @Test
+    fun `responses stream adapter merges argument events that arrive before call metadata`() {
+        val chunks = mutableListOf<String>()
+        val wrapped = HttpController.wrapResponsesListener(
+            object : EventSourceListener() {
+                override fun onEvent(
+                    eventSource: EventSource,
+                    id: String?,
+                    type: String?,
+                    data: String,
+                ) {
+                    chunks += data
+                }
+            },
+        )
+
+        val source = dummyEventSource()
+        wrapped.onEvent(
+            source,
+            null,
+            "response.function_call_arguments.delta",
+            """{"type":"response.function_call_arguments.delta","item_id":"msg_tool_1","delta":"{\"city\":\"Shanghai\"}","output_index":1}""",
+        )
+        wrapped.onEvent(
+            source,
+            null,
+            "response.output_item.added",
+            """{"type":"response.output_item.added","item":{"type":"function_call","id":"msg_tool_1","call_id":"call_7","name":"get_weather","arguments":"","status":"in_progress"}}""",
+        )
+        wrapped.onEvent(
+            source,
+            null,
+            "response.function_call_arguments.done",
+            """{"type":"response.function_call_arguments.done","item_id":"msg_tool_1","name":"get_weather","arguments":"{\"city\":\"Shanghai\"}","output_index":1}""",
+        )
+        wrapped.onEvent(
+            source,
+            null,
+            "response.completed",
+            """{"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}""",
+        )
+
+        val accumulator = AgentLlmStreamAccumulator(json)
+        chunks.forEach(accumulator::consume)
+        val turn = accumulator.buildTurn()
+
+        assertEquals(1, turn.message.toolCalls?.size)
+        assertEquals("call_7", turn.message.toolCalls?.single()?.id)
+        assertEquals("get_weather", turn.message.toolCalls?.single()?.function?.name)
+        assertEquals(
+            """{"city":"Shanghai"}""",
+            turn.message.toolCalls?.single()?.function?.arguments,
+        )
+    }
+
+    @Test
+    fun `responses stream adapter does not append completed arguments after fragmented deltas`() {
+        val chunks = mutableListOf<String>()
+        val wrapped = HttpController.wrapResponsesListener(
+            object : EventSourceListener() {
+                override fun onEvent(
+                    eventSource: EventSource,
+                    id: String?,
+                    type: String?,
+                    data: String,
+                ) {
+                    chunks += data
+                }
+            },
+        )
+
+        val source = dummyEventSource()
+        wrapped.onEvent(
+            source,
+            null,
+            "response.output_item.added",
+            """{"type":"response.output_item.added","item":{"type":"function_call","id":"msg_submit","call_id":"call_submit","name":"submit_json","arguments":""}}""",
+        )
+        wrapped.onEvent(
+            source,
+            null,
+            "response.function_call_arguments.delta",
+            """{"type":"response.function_call_arguments.delta","item_id":"msg_submit","delta":"{\"parameters\":"}""",
+        )
+        wrapped.onEvent(
+            source,
+            null,
+            "response.function_call_arguments.delta",
+            """{"type":"response.function_call_arguments.delta","item_id":"msg_submit","delta":"[]}"}""",
+        )
+        wrapped.onEvent(
+            source,
+            null,
+            "response.function_call_arguments.done",
+            """{"type":"response.function_call_arguments.done","item_id":"msg_submit","name":"submit_json","arguments":"{\"parameters\":[]}"}""",
+        )
+        wrapped.onEvent(
+            source,
+            null,
+            "response.completed",
+            """{"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}}}""",
+        )
+
+        val accumulator = AgentLlmStreamAccumulator(json)
+        chunks.forEach(accumulator::consume)
+        val turn = accumulator.buildTurn()
+
+        assertEquals(
+            """{"parameters":[]}""",
+            turn.message.toolCalls?.single()?.function?.arguments,
+        )
     }
 
     @Test
